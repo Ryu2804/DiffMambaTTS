@@ -16,8 +16,6 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-import torchaudio
-from librosa.filters import mel as librosa_mel_fn
 from torch import nn
 from x_transformers.x_transformers import apply_rotary_pos_emb
 
@@ -42,6 +40,9 @@ def get_bigvgan_mel_spectrogram(
     fmax=None,
     center=False,
 ):  # Copy from https://github.com/NVIDIA/BigVGAN/tree/main
+    # Lazy import to avoid heavy librosa import at module import time.
+    from librosa.filters import mel as librosa_mel_fn
+
     device = waveform.device
     key = f"{n_fft}_{n_mel_channels}_{target_sample_rate}_{hop_length}_{win_length}_{fmin}_{fmax}_{device}"
 
@@ -84,6 +85,9 @@ def get_vocos_mel_spectrogram(
     hop_length=256,
     win_length=1024,
 ):
+    # Lazy import to keep backbone-only imports lightweight.
+    import torchaudio
+
     mel_stft = torchaudio.transforms.MelSpectrogram(
         sample_rate=target_sample_rate,
         n_fft=n_fft,

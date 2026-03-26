@@ -264,14 +264,22 @@ class Trainer:
 
     def train(self, train_dataset: Dataset, num_workers=16, resumable_with_seed: int = None):
         if self.log_samples:
-            from f5_tts.infer.utils_infer import cfg_strength, load_vocoder, nfe_step, sway_sampling_coef
+            try:
+                from f5_tts.infer.utils_infer import cfg_strength, load_vocoder, nfe_step, sway_sampling_coef
 
-            vocoder = load_vocoder(
-                vocoder_name=self.vocoder_name, is_local=self.is_local_vocoder, local_path=self.local_vocoder_path
-            )
-            target_sample_rate = self.accelerator.unwrap_model(self.model).mel_spec.target_sample_rate
-            log_samples_path = f"{self.checkpoint_path}/samples"
-            os.makedirs(log_samples_path, exist_ok=True)
+                vocoder = load_vocoder(
+                    vocoder_name=self.vocoder_name, is_local=self.is_local_vocoder, local_path=self.local_vocoder_path
+                )
+                target_sample_rate = self.accelerator.unwrap_model(self.model).mel_spec.target_sample_rate
+                log_samples_path = f"{self.checkpoint_path}/samples"
+                os.makedirs(log_samples_path, exist_ok=True)
+            except Exception as e:
+                if self.accelerator.is_local_main_process:
+                    print(
+                        "F5-TTS WARNING: disable log_samples because vocoder initialization failed. "
+                        f"Reason: {e}"
+                    )
+                self.log_samples = False
 
         if exists(resumable_with_seed):
             generator = torch.Generator()
@@ -285,7 +293,7 @@ class Trainer:
                 collate_fn=collate_fn,
                 num_workers=num_workers,
                 pin_memory=True,
-                persistent_workers=True,
+                persistent_workers=num_workers > 0,
                 batch_size=self.batch_size_per_gpu,
                 shuffle=True,
                 generator=generator,
@@ -305,7 +313,7 @@ class Trainer:
                 collate_fn=collate_fn,
                 num_workers=num_workers,
                 pin_memory=True,
-                persistent_workers=True,
+                persistent_workers=num_workers > 0,
                 batch_sampler=batch_sampler,
             )
         else:

@@ -1,0 +1,63 @@
+hydra:
+  run:
+    dir: ckpts/${model.name}_${model.mel_spec.mel_spec_type}_${model.tokenizer}_${datasets.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+datasets:
+  name: indonesian  # your dataset folder name (used for tokenizer lookup)
+  batch_size_per_gpu: 19200  # ~half of F5Base; scale to your VRAM
+  batch_size_type: frame
+  max_samples: 64
+  num_workers: 4
+
+optim:
+  epochs: 50
+  learning_rate: 2e-4
+  num_warmup_updates: 4000
+  grad_accumulation_steps: 2
+  max_grad_norm: 1.0
+  bnb_optimizer: False
+
+model:
+  name: Mamba3TTS_Base
+  tokenizer: custom          # use 'pinyin' or 'custom'; set tokenizer_path if custom
+  tokenizer_path: null       # path to vocab.txt if tokenizer=custom
+  backbone: Mamba3Backbone   # resolved via hydra.utils.get_class("f5_tts.model.Mamba3Backbone")
+  arch:
+    # ── Shared with DiT ────────────────────────────────────────────────
+    dim: 1024
+    depth: 22
+    ff_mult: 2
+    text_dim: 512
+    text_mask_padding: True
+    conv_layers: 4
+    checkpoint_activations: False
+    dropout: 0.0
+    # ── Mamba-3 specific ───────────────────────────────────────────────
+    d_state: 128           # SSM state size N (try 64 to reduce memory)
+    headdim: 64            # head dimension p; nheads = dim*expand / headdim
+    ngroups: 1             # number of B/C groups (≥1; 1=SISO-like)
+    rope_fraction: 0.5     # fraction of state used for RoPE
+    is_mimo: False         # set True to enable MIMO (requires TileLang)
+    mimo_rank: 1           # MIMO rank R; ignored when is_mimo=False
+    chunk_size: 64         # chunk size for Triton scan kernel
+  mel_spec:
+    target_sample_rate: 24000
+    n_mel_channels: 100
+    hop_length: 256
+    win_length: 1024
+    n_fft: 1024
+    mel_spec_type: vocos   # vocos | bigvgan
+  vocoder:
+    is_local: False
+    local_path: null
+
+ckpts:
+  logger: wandb
+  wandb_project: Mamba3-TTS
+  wandb_run_name: ${model.name}_${model.mel_spec.mel_spec_type}_${model.tokenizer}_${datasets.name}
+  wandb_resume_id: null
+  log_samples: True
+  save_per_updates: 10000
+  keep_last_n_checkpoints: 3
+  last_per_updates: 2000
+  save_dir: ckpts/${model.name}_${model.mel_spec.mel_spec_type}_${model.tokenizer}_${datasets.name}

@@ -19,15 +19,22 @@ import signal
 import subprocess
 import sys
 from contextlib import contextmanager
+from pathlib import Path
 
+# Ensure `f5_tts` can be imported when this file is run directly.
+project_src = Path(__file__).resolve().parents[3]
+if str(project_src) not in sys.path:
+    sys.path.insert(0, str(project_src))
 
-sys.path.append(os.getcwd())
+# Keep cwd fallback for custom launch setups.
+cwd = os.getcwd()
+if cwd not in sys.path:
+    sys.path.append(cwd)
 
 import argparse
 import csv
 import json
 from importlib.resources import files
-from pathlib import Path
 
 import soundfile as sf
 import torchaudio
@@ -254,7 +261,7 @@ def save_prepped_dataset(out_dir, result, duration_list, text_vocab_set, is_fine
         file_vocab_finetune = PRETRAINED_VOCAB_PATH.as_posix()
         shutil.copy2(file_vocab_finetune, voca_out_path)
     else:
-        with open(voca_out_path.as_posix(), "w") as f:
+        with open(voca_out_path.as_posix(), "w", encoding="utf-8") as f:
             for vocab in sorted(text_vocab_set):
                 f.write(vocab + "\n")
 
