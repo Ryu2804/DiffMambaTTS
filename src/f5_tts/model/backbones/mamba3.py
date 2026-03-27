@@ -21,6 +21,7 @@ from functools import lru_cache
 from importlib.util import find_spec
 from pathlib import Path
 import sys
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -42,10 +43,22 @@ from f5_tts.model.modules import (
 
 
 class _FallbackMamba3(nn.Module):
-    """CPU-safe fallback used when mamba kernels are unavailable."""
+    """CPU-safe fallback used when mamba kernels are unavailable.
+
+    WARNING: This is a non-SSM placeholder (Linear+GELU). It does NOT have
+    the sequence-mixing or state-space properties of a real Mamba kernel.
+    Install `mamba_ssm` + `causal_conv1d` for correct behaviour.
+    """
 
     def __init__(self, d_model: int, dropout: float = 0.0, **kwargs):
         super().__init__()
+        warnings.warn(
+            "mamba_ssm not found — using _FallbackMamba3 (two Linear layers). "
+            "Training will proceed but WITHOUT a real SSM scan. "
+            "Install `mamba_ssm` and `causal_conv1d` to fix this.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         self.net = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.GELU(),
@@ -200,13 +213,17 @@ class InputEmbedding(nn.Module):
 
 class Mamba3Block(nn.Module):
     """
-    A single processing block that pairs an AdaLayerNorm-conditioned Mamba-3 SSM
-    with an AdaLayerNorm-conditioned FeedForward MLP.
+    A single processing block that pairs an AdaLayerNorm-conditioned **bidirectional**
+    Mamba-3 SSM with a separately AdaLayerNorm-conditioned FeedForward MLP.
+
+    Bidirectionality: two independent SSM instances scan the sequence forward and
+    backward; their outputs are summed before the residual add.  This is required
+    for non-causal tasks such as TTS diffusion where every frame needs full context.
 
     Interface matches DiTBlock.forward(x, t, mask, rope):
       - rope is accepted but ignored (Mamba-3 has internal data-dependent RoPE).
-      - mask is accepted but currently not applied inside the SSM scan
-        (Mamba-3's causal scan is naturally compatible with padding).
+      - mask is zeroed in/out of the SSM scan to prevent gradient leakage from
+        padding positions into valid frames.
     """
 
     def __init__(
@@ -226,12 +243,12 @@ class Mamba3Block(nn.Module):
     ):
         super().__init__()
 
-        # AdaLayerNorm for SSM input (same as DiTBlock.attn_norm)
+        # AdaLayerNorm for SSM path — produces independent modulation for the SSM.
         self.ssm_norm = AdaLayerNorm(dim)
 
-        # Mamba-3 SSM (replaces self-attention)
+        # Build SSM kwargs once so both fwd/bwd share the same hyper-params.
         mamba3_impl = _resolve_mamba3_impl()
-        self.ssm = mamba3_impl(
+        _ssm_kwargs = dict(
             d_model=dim,
             d_state=d_state,
             headdim=headdim,
@@ -243,9 +260,14 @@ class Mamba3Block(nn.Module):
             dropout=dropout,
             layer_idx=layer_idx,
         )
+        # Forward scan
+        self.ssm = mamba3_impl(**_ssm_kwargs)
+        # Backward scan — separate parameters, same architecture
+        self.ssm_bwd = mamba3_impl(**_ssm_kwargs)
 
-        # AdaLayerNorm + FeedForward (same as DiTBlock ff path)
-        self.ff_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        # Separate AdaLayerNorm for FF path (independent modulation from SSM path).
+        # This matches the DiT design intent where attn and MLP have distinct AdaLNs.
+        self.ff_norm_ada = AdaLayerNorm(dim)
         self.ff = FeedForward(dim=dim, mult=ff_mult, dropout=dropout, approximate="tanh")
 
     def forward(
@@ -255,17 +277,37 @@ class Mamba3Block(nn.Module):
         mask: "bool[b n] | None" = None,
         rope=None,  # accepted for API compatibility, ignored
     ):
-        # --- SSM path (mirrors DiTBlock attention path) ---
-        norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.ssm_norm(x, emb=t)
+        # ------------------------------------------------------------------ #
+        # SSM path  (bidirectional = forward scan + backward scan)
+        # ------------------------------------------------------------------ #
+        norm, gate_msa, _, _, _ = self.ssm_norm(x, emb=t)
 
-        # Mamba-3 forward: (B, T, D) → (B, T, D)
-        ssm_out = self.ssm(norm)
+        # Zero-out padding positions *before* the scan so padding tokens do
+        # not inject gradients into valid positions via the state update.
+        if mask is not None:
+            norm = norm.masked_fill(~mask.unsqueeze(-1), 0.0)
+
+        # Forward scan: left-to-right
+        fwd = self.ssm(norm)
+        # Backward scan: flip sequence, scan left-to-right, flip back.
+        # Each token's backward output therefore summarises right-context.
+        bwd = self.ssm_bwd(norm.flip(1)).flip(1)
+        ssm_out = fwd + bwd
+
+        # Zero-out padding positions *after* the scan as well.
+        if mask is not None:
+            ssm_out = ssm_out.masked_fill(~mask.unsqueeze(-1), 0.0)
 
         x = x + gate_msa.unsqueeze(1) * ssm_out
 
-        # --- FeedForward path ---
-        norm = self.ff_norm(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
-        ff_out = self.ff(norm)
+        # ------------------------------------------------------------------ #
+        # FeedForward path  (independent AdaLayerNorm)
+        # ------------------------------------------------------------------ #
+        ff_norm, _, shift_mlp, scale_mlp, gate_mlp = self.ff_norm_ada(x, emb=t)
+        # ff_norm already has shift_msa / scale_msa applied by ff_norm_ada;
+        # additionally apply the MLP-specific shift/scale for full expressivity.
+        ff_norm = ff_norm * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        ff_out = self.ff(ff_norm)
         x = x + gate_mlp.unsqueeze(1) * ff_out
 
         return x
@@ -376,15 +418,22 @@ class Mamba3Backbone(nn.Module):
     # ------------------------------------------------------------------
 
     def initialize_weights(self):
-        """Zero-out adaLN and output layers for stable training (same as DiT)."""
+        """Zero-out adaLN modulation layers for stable training start (same as DiT).
+
+        proj_out is intentionally NOT zero-initialised: combined with a real SSM
+        scan, zero proj_out would make the model extremely slow to produce
+        meaningful predictions early in training.
+        """
         for block in self.transformer_blocks:
+            # SSM-path AdaLN
             nn.init.constant_(block.ssm_norm.linear.weight, 0)
             nn.init.constant_(block.ssm_norm.linear.bias, 0)
+            # FF-path AdaLN (separate, independent modulation)
+            nn.init.constant_(block.ff_norm_ada.linear.weight, 0)
+            nn.init.constant_(block.ff_norm_ada.linear.bias, 0)
 
         nn.init.constant_(self.norm_out.linear.weight, 0)
         nn.init.constant_(self.norm_out.linear.bias, 0)
-        nn.init.constant_(self.proj_out.weight, 0)
-        nn.init.constant_(self.proj_out.bias, 0)
 
     # ------------------------------------------------------------------
     # Input embedding with caching (identical interface to DiT)
@@ -424,7 +473,15 @@ class Mamba3Backbone(nn.Module):
     # Gradient checkpointing wrapper
     # ------------------------------------------------------------------
 
-    def ckpt_wrapper(self, module):
+    @staticmethod
+    def ckpt_wrapper(module):
+        """Wrap a module for use with torch.utils.checkpoint.
+
+        Using @staticmethod avoids implicitly capturing ``self`` in the closure,
+        which would be fragile if ``self`` ever holds non-tensor state that
+        changes between forward calls.  The module itself is still captured but
+        that is unavoidable and safe (its parameter tensors are what matter).
+        """
         def ckpt_forward(*inputs):
             return module(*inputs)
         return ckpt_forward
