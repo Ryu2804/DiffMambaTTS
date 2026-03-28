@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import inspect
 from importlib.util import find_spec
+import os
 from pathlib import Path
 import sys
 import warnings
@@ -41,7 +42,6 @@ from f5_tts.model.modules import (
 # ---------------------------------------------------------------------------
 
 _MAMBA3_IMPL_CACHE = None
-
 
 class _FallbackMamba3(nn.Module):
     """CPU-safe fallback used when mamba kernels are unavailable.
@@ -95,7 +95,14 @@ def _resolve_mamba3_impl():
 
         _MAMBA3_IMPL_CACHE = Mamba3
         return Mamba3
-    except Exception:
+    except Exception as exc:
+        msg = (
+            "Failed to import mamba_ssm.modules.mamba3.Mamba3; "
+            f"falling back to _FallbackMamba3. Root cause: {exc!r}"
+        )
+        if os.environ.get("F5_TTS_REQUIRE_MAMBA3", "0") == "1":
+            raise RuntimeError(msg) from exc
+        warnings.warn(msg, RuntimeWarning, stacklevel=2)
         return _FallbackMamba3
 
 
