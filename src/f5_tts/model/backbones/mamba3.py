@@ -17,7 +17,7 @@ Interface contract (must match DiT exactly so CFM/Trainer work without changes):
 
 from __future__ import annotations
 
-from functools import lru_cache
+import inspect
 from importlib.util import find_spec
 from pathlib import Path
 import sys
@@ -29,7 +29,6 @@ from torch import nn
 
 # Reuse F5-TTS modules (text encoder, input proj, timestep emb, norms, etc.)
 from f5_tts.model.modules import (
-    AdaLayerNorm,
     AdaLayerNorm_Final,
     ConvNeXtV2Block,
     FeedForward,
@@ -40,6 +39,8 @@ from f5_tts.model.modules import (
 # ---------------------------------------------------------------------------
 # Mamba-3 resolver
 # ---------------------------------------------------------------------------
+
+_MAMBA3_IMPL_CACHE = None
 
 
 class _FallbackMamba3(nn.Module):
@@ -70,7 +71,6 @@ class _FallbackMamba3(nn.Module):
         return self.net(u)
 
 
-@lru_cache(maxsize=1)
 def _resolve_mamba3_impl():
     """
     Resolve the Mamba3 implementation lazily.
@@ -79,6 +79,10 @@ def _resolve_mamba3_impl():
     2) Try vendored ``src/third_party/mamba``.
     3) Fall back to a lightweight block so tests can still run.
     """
+    global _MAMBA3_IMPL_CACHE
+    if _MAMBA3_IMPL_CACHE is not None:
+        return _MAMBA3_IMPL_CACHE
+
     if find_spec("mamba_ssm") is None:
         vendored_root = Path(__file__).resolve().parents[3] / "third_party" / "mamba"
         if vendored_root.exists():
@@ -89,6 +93,7 @@ def _resolve_mamba3_impl():
     try:
         from mamba_ssm.modules.mamba3 import Mamba3  # type: ignore
 
+        _MAMBA3_IMPL_CACHE = Mamba3
         return Mamba3
     except Exception:
         return _FallbackMamba3
@@ -109,12 +114,17 @@ class TextEmbedding(nn.Module):
         text_num_embeds: int,
         text_dim: int,
         mask_padding: bool = True,
+        average_upsampling: bool = False,
         conv_layers: int = 0,
         conv_mult: int = 2,
     ):
         super().__init__()
         self.text_embed = nn.Embedding(text_num_embeds + 1, text_dim)  # 0 = filler
         self.mask_padding = mask_padding
+        self.average_upsampling = average_upsampling
+
+        if average_upsampling:
+            assert mask_padding, "text_embedding_average_upsampling requires text_mask_padding to be True"
 
         if conv_layers > 0:
             self.extra_modeling = True
@@ -130,7 +140,38 @@ class TextEmbedding(nn.Module):
         else:
             self.extra_modeling = False
 
-    def forward(self, text: "int[b nt]", seq_len, drop_text: bool = False):
+    def average_upsample_text_by_mask(self, text, text_mask, target_lens):
+        batch, _, _ = text.shape
+        text_lens = text_mask.sum(dim=1)
+
+        upsampled_text = torch.zeros_like(text)
+
+        for i in range(batch):
+            text_len = int(text_lens[i].item())
+            audio_len = int(target_lens[i].item())
+
+            if text_len == 0 or audio_len <= 0:
+                continue
+
+            valid_ind = torch.where(text_mask[i])[0]
+            valid_data = text[i, valid_ind, :]
+
+            base_repeat = audio_len // text_len
+            remainder = audio_len % text_len
+
+            indices = []
+            for j in range(text_len):
+                repeat_count = base_repeat + (1 if j >= text_len - remainder else 0)
+                indices.extend([j] * repeat_count)
+
+            indices = torch.tensor(indices[:audio_len], device=text.device, dtype=torch.long)
+            upsampled = valid_data[indices]
+
+            upsampled_text[i, :audio_len, :] = upsampled
+
+        return upsampled_text
+
+    def forward(self, text: torch.Tensor, seq_len, drop_text: bool = False):
         text = text + 1  # shift: -1 pad → 0 filler
 
         if torch.is_tensor(seq_len):
@@ -173,7 +214,31 @@ class TextEmbedding(nn.Module):
             else:
                 text = self.text_blocks(text)
 
+        if self.average_upsampling:
+            if torch.is_tensor(seq_len):
+                target_lens = seq_len.to(device=text.device, dtype=torch.long)
+            else:
+                target_lens = torch.full((text.shape[0],), int(seq_len), device=text.device, dtype=torch.long)
+
+            text = self.average_upsample_text_by_mask(text, ~text_mask, target_lens)
+
         return text
+
+
+class AdaLayerNormSimple(nn.Module):
+    """AdaLayerNorm variant that returns only SSM modulation terms."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.silu = nn.SiLU()
+        self.linear = nn.Linear(dim, dim * 3)
+        self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+
+    def forward(self, x, emb):
+        emb = self.linear(self.silu(emb))
+        shift, scale, gate = torch.chunk(emb, 3, dim=1)
+        x = self.norm(x) * (1 + scale[:, None]) + shift[:, None]
+        return x, gate
 
 
 # ---------------------------------------------------------------------------
@@ -194,11 +259,11 @@ class InputEmbedding(nn.Module):
 
     def forward(
         self,
-        x: "float[b n d]",
-        cond: "float[b n d]",
-        text_embed: "float[b n d]",
+        x: torch.Tensor,
+        cond: torch.Tensor,
+        text_embed: torch.Tensor,
         drop_audio_cond: bool = False,
-        audio_mask: "bool[b n] | None" = None,
+        audio_mask: torch.Tensor | None = None,
     ):
         if drop_audio_cond:
             cond = torch.zeros_like(cond)
@@ -243,8 +308,8 @@ class Mamba3Block(nn.Module):
     ):
         super().__init__()
 
-        # AdaLayerNorm for SSM path — produces independent modulation for the SSM.
-        self.ssm_norm = AdaLayerNorm(dim)
+        # AdaLayerNorm for SSM path (shift, scale, gate only).
+        self.ssm_norm = AdaLayerNormSimple(dim)
 
         # Build SSM kwargs once so both fwd/bwd share the same hyper-params.
         mamba3_impl = _resolve_mamba3_impl()
@@ -257,30 +322,40 @@ class Mamba3Block(nn.Module):
             is_mimo=is_mimo,
             mimo_rank=mimo_rank,
             chunk_size=chunk_size,
-            dropout=dropout,
             layer_idx=layer_idx,
         )
+        supports_dropout = False
+        try:
+            sig = inspect.signature(mamba3_impl.__init__)
+            supports_dropout = "dropout" in sig.parameters
+        except (TypeError, ValueError):
+            supports_dropout = False
+
+        if supports_dropout:
+            _ssm_kwargs["dropout"] = dropout
+
         # Forward scan
         self.ssm = mamba3_impl(**_ssm_kwargs)
         # Backward scan — separate parameters, same architecture
         self.ssm_bwd = mamba3_impl(**_ssm_kwargs)
+        self.ssm_dropout = nn.Identity() if (dropout == 0.0 or supports_dropout) else nn.Dropout(dropout)
 
-        # Separate AdaLayerNorm for FF path (independent modulation from SSM path).
-        # This matches the DiT design intent where attn and MLP have distinct AdaLNs.
-        self.ff_norm_ada = AdaLayerNorm(dim)
+        # FF path uses plain LN, then explicit MLP modulation.
+        self.ff_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.ff_ada_proj = nn.Linear(dim, dim * 3)
         self.ff = FeedForward(dim=dim, mult=ff_mult, dropout=dropout, approximate="tanh")
 
     def forward(
         self,
-        x: "float[b n d]",
-        t: "float[b d]",
-        mask: "bool[b n] | None" = None,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        mask: torch.Tensor | None = None,
         rope=None,  # accepted for API compatibility, ignored
     ):
         # ------------------------------------------------------------------ #
         # SSM path  (bidirectional = forward scan + backward scan)
         # ------------------------------------------------------------------ #
-        norm, gate_msa, _, _, _ = self.ssm_norm(x, emb=t)
+        norm, gate_msa = self.ssm_norm(x, emb=t)
 
         # Zero-out padding positions *before* the scan so padding tokens do
         # not inject gradients into valid positions via the state update.
@@ -292,7 +367,7 @@ class Mamba3Block(nn.Module):
         # Backward scan: flip sequence, scan left-to-right, flip back.
         # Each token's backward output therefore summarises right-context.
         bwd = self.ssm_bwd(norm.flip(1)).flip(1)
-        ssm_out = fwd + bwd
+        ssm_out = self.ssm_dropout(fwd + bwd)
 
         # Zero-out padding positions *after* the scan as well.
         if mask is not None:
@@ -303,10 +378,9 @@ class Mamba3Block(nn.Module):
         # ------------------------------------------------------------------ #
         # FeedForward path  (independent AdaLayerNorm)
         # ------------------------------------------------------------------ #
-        ff_norm, _, shift_mlp, scale_mlp, gate_mlp = self.ff_norm_ada(x, emb=t)
-        # ff_norm already has shift_msa / scale_msa applied by ff_norm_ada;
-        # additionally apply the MLP-specific shift/scale for full expressivity.
-        ff_norm = ff_norm * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        ff_ada = self.ff_ada_proj(F.silu(t))
+        shift_mlp, scale_mlp, gate_mlp = torch.chunk(ff_ada, 3, dim=1)
+        ff_norm = self.ff_norm(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
         ff_out = self.ff(ff_norm)
         x = x + gate_mlp.unsqueeze(1) * ff_out
 
@@ -375,6 +449,7 @@ class Mamba3Backbone(nn.Module):
             text_num_embeds,
             text_dim,
             mask_padding=text_mask_padding,
+            average_upsampling=text_embedding_average_upsampling,
             conv_layers=conv_layers,
         )
         self.text_cond = None
@@ -428,9 +503,9 @@ class Mamba3Backbone(nn.Module):
             # SSM-path AdaLN
             nn.init.constant_(block.ssm_norm.linear.weight, 0)
             nn.init.constant_(block.ssm_norm.linear.bias, 0)
-            # FF-path AdaLN (separate, independent modulation)
-            nn.init.constant_(block.ff_norm_ada.linear.weight, 0)
-            nn.init.constant_(block.ff_norm_ada.linear.bias, 0)
+            # FF-path explicit modulation projection
+            nn.init.constant_(block.ff_ada_proj.weight, 0)
+            nn.init.constant_(block.ff_ada_proj.bias, 0)
 
         nn.init.constant_(self.norm_out.linear.weight, 0)
         nn.init.constant_(self.norm_out.linear.bias, 0)
@@ -447,7 +522,7 @@ class Mamba3Backbone(nn.Module):
         drop_audio_cond: bool = False,
         drop_text: bool = False,
         cache: bool = True,
-        audio_mask: "bool[b n] | None" = None,
+        audio_mask: torch.Tensor | None = None,
     ):
         if self.text_uncond is None or self.text_cond is None or not cache:
             seq_len = x.shape[1] if audio_mask is None else audio_mask.sum(dim=1)
@@ -492,11 +567,11 @@ class Mamba3Backbone(nn.Module):
 
     def forward(
         self,
-        x: "float[b n d]",          # noised input mel
-        cond: "float[b n d]",        # masked conditioning mel
-        text: "int[b nt]",           # text token indices
-        time: "float[b] | float[]",  # flow timestep
-        mask: "bool[b n] | None" = None,
+        x: torch.Tensor,          # noised input mel
+        cond: torch.Tensor,        # masked conditioning mel
+        text: torch.Tensor,           # text token indices
+        time: torch.Tensor,  # flow timestep
+        mask: torch.Tensor | None = None,
         drop_audio_cond: bool = False,
         drop_text: bool = False,
         cfg_infer: bool = False,     # pack cond+uncond for CFG

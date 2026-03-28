@@ -4,7 +4,7 @@ hydra:
 
 datasets:
   name: indonesian  # your dataset folder name (used for tokenizer lookup)
-  batch_size_per_gpu: 19200  # ~half of F5Base; scale to your VRAM
+  batch_size_per_gpu: 1600  # conservative default for 16GB GPUs; scale up to your VRAM
   batch_size_type: frame
   max_samples: 64
   num_workers: 4
