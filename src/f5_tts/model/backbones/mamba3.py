@@ -507,6 +507,58 @@ class Mamba3Block(nn.Module):
         self.ff_ada_proj = nn.Linear(dim, dim * 3)
         self.ff = FeedForward(dim=dim, mult=ff_mult, dropout=dropout, approximate="tanh")
 
+    def _ssm_forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """SSM sub-path only (AdaLN + bidirectional Mamba3 scan + residual add).
+
+        Kept as a separate method so the backbone can run it WITHOUT gradient
+        checkpointing.  The Mamba3 Triton kernel is a custom autograd.Function
+        that calls ``ctx.saved_tensors`` in its backward.  Wrapping it inside
+        ``torch.utils.checkpoint(use_reentrant=False)`` installs pack/unpack
+        hooks that conflict with the kernel's own saved-tensor bookkeeping,
+        raising ``CheckpointError: already unpacked once``.  The chunked Triton
+        scan is already memory-efficient on its own, so an outer checkpoint
+        adds no benefit and only causes errors.
+        """
+        norm, gate_msa = self.ssm_norm(x, emb=t)
+
+        if mask is not None:
+            norm = norm.masked_fill(~mask.unsqueeze(-1), 0.0)
+
+        fwd = self.ssm(norm)
+        if self.ssm_bwd is not None:
+            bwd = self.ssm_bwd(norm.flip(1)).flip(1)
+            ssm_out = self.ssm_dropout(fwd + bwd)
+        else:
+            ssm_out = self.ssm_dropout(fwd)
+
+        if mask is not None:
+            ssm_out = ssm_out.masked_fill(~mask.unsqueeze(-1), 0.0)
+
+        return x + gate_msa.unsqueeze(1) * ssm_out
+
+    def _ff_forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        """FeedForward sub-path only (AdaLN + MLP + residual add).
+
+        Kept as a separate method so the backbone can wrap ONLY this path in
+        ``torch.utils.checkpoint``.  The FF block contains only standard PyTorch
+        ops with no custom autograd.Function, so checkpointing is safe here and
+        meaningfully reduces peak activation memory.
+        """
+        ff_ada = self.ff_ada_proj(F.silu(t))
+        shift_mlp, scale_mlp, gate_mlp = torch.chunk(ff_ada, 3, dim=1)
+        ff_norm = self.ff_norm(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        ff_out = self.ff(ff_norm)
+        return x + gate_mlp.unsqueeze(1) * ff_out
+
     def forward(
         self,
         x: torch.Tensor,
@@ -514,41 +566,10 @@ class Mamba3Block(nn.Module):
         mask: torch.Tensor | None = None,
         rope=None,  # accepted for API compatibility, ignored
     ):
-        # ------------------------------------------------------------------ #
-        # SSM path  (bidirectional = forward scan + backward scan)
-        # ------------------------------------------------------------------ #
-        norm, gate_msa = self.ssm_norm(x, emb=t)
-
-        # Zero-out padding positions *before* the scan so padding tokens do
-        # not inject gradients into valid positions via the state update.
-        if mask is not None:
-            norm = norm.masked_fill(~mask.unsqueeze(-1), 0.0)
-
-        # Forward scan: left-to-right
-        fwd = self.ssm(norm)
-        if self.ssm_bwd is not None:
-            # Backward scan: flip sequence, scan left-to-right, flip back.
-            # Each token's backward output therefore summarises right-context.
-            bwd = self.ssm_bwd(norm.flip(1)).flip(1)
-            ssm_out = self.ssm_dropout(fwd + bwd)
-        else:
-            ssm_out = self.ssm_dropout(fwd)
-
-        # Zero-out padding positions *after* the scan as well.
-        if mask is not None:
-            ssm_out = ssm_out.masked_fill(~mask.unsqueeze(-1), 0.0)
-
-        x = x + gate_msa.unsqueeze(1) * ssm_out
-
-        # ------------------------------------------------------------------ #
-        # FeedForward path  (independent AdaLayerNorm)
-        # ------------------------------------------------------------------ #
-        ff_ada = self.ff_ada_proj(F.silu(t))
-        shift_mlp, scale_mlp, gate_mlp = torch.chunk(ff_ada, 3, dim=1)
-        ff_norm = self.ff_norm(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
-        ff_out = self.ff(ff_norm)
-        x = x + gate_mlp.unsqueeze(1) * ff_out
-
+        # SSM path — never checkpointed (Triton kernel manages its own memory)
+        x = self._ssm_forward(x, t, mask)
+        # FF path — optionally checkpointed by the backbone
+        x = self._ff_forward(x, t)
         return x
 
 
@@ -721,17 +742,19 @@ class Mamba3Backbone(nn.Module):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def ckpt_wrapper(module):
-        """Wrap a module for use with torch.utils.checkpoint.
+    def _ckpt_ff(block, x, t):
+        """Thin wrapper so checkpoint can call block._ff_forward(x, t).
 
-        Using @staticmethod avoids implicitly capturing ``self`` in the closure,
-        which would be fragile if ``self`` ever holds non-tensor state that
-        changes between forward calls.  The module itself is still captured but
-        that is unavoidable and safe (its parameter tensors are what matter).
+        Only the FeedForward sub-path is checkpointed.  The Mamba3 SSM sub-path
+        must NOT be wrapped in torch.utils.checkpoint(use_reentrant=False)
+        because the Triton kernel is a custom autograd.Function whose backward
+        calls ctx.saved_tensors — conflicting with checkpoint's pack/unpack hooks
+        and raising CheckpointError: 'already unpacked once'.
+        The Mamba3 chunked scan is already memory-efficient by design (processes
+        the sequence in O(chunk) memory), so an outer checkpoint on the SSM path
+        provides no benefit and only causes the error above.
         """
-        def ckpt_forward(*inputs):
-            return module(*inputs)
-        return ckpt_forward
+        return block._ff_forward(x, t)
 
     # ------------------------------------------------------------------
     # Forward pass (identical signature to DiT.forward)
@@ -785,12 +808,21 @@ class Mamba3Backbone(nn.Module):
         # Mamba-3 block stack
         # rope=None since Mamba-3 has its own internal data-dependent RoPE
         for block in self.transformer_blocks:
+            # SSM sub-path: NEVER checkpointed.
+            # The Mamba3 Triton kernel is a custom autograd.Function; wrapping it
+            # in torch.utils.checkpoint(use_reentrant=False) installs pack/unpack
+            # hooks that conflict with ctx.saved_tensors in the kernel backward,
+            # raising CheckpointError: "already unpacked once". The chunked scan
+            # is already memory-efficient on its own.
+            x = block._ssm_forward(x, t, mask)
+
+            # FF sub-path: optionally checkpointed (pure PyTorch ops, safe).
             if self.checkpoint_activations:
                 x = torch.utils.checkpoint.checkpoint(
-                    self.ckpt_wrapper(block), x, t, mask, None, use_reentrant=False
+                    self._ckpt_ff, block, x, t, use_reentrant=False
                 )
             else:
-                x = block(x, t, mask=mask, rope=None)
+                x = block._ff_forward(x, t)
 
         if self.long_skip_connection is not None:
             x = self.long_skip_connection(torch.cat((x, residual), dim=-1))
