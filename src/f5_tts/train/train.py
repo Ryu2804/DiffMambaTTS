@@ -16,6 +16,8 @@ os.chdir(str(files("f5_tts").joinpath("../..")))  # change working directory to 
 
 @hydra.main(version_base="1.3", config_path=str(files("f5_tts").joinpath("configs")), config_name=None)
 def main(model_cfg):
+    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
     model_cls = hydra.utils.get_class(f"f5_tts.model.{model_cfg.model.backbone}")
     model_arc = model_cfg.model.arch
     tokenizer = model_cfg.model.tokenizer
@@ -42,6 +44,11 @@ def main(model_cfg):
         vocab_char_map=vocab_char_map,
     )
 
+    accelerate_kwargs = {}
+    mixed_precision = model_cfg.optim.get("mixed_precision", None)
+    if mixed_precision is not None:
+        accelerate_kwargs["mixed_precision"] = str(mixed_precision)
+
     # init trainer
     trainer = Trainer(
         model,
@@ -67,6 +74,7 @@ def main(model_cfg):
         is_local_vocoder=model_cfg.model.vocoder.is_local,
         local_vocoder_path=model_cfg.model.vocoder.local_path,
         model_cfg_dict=OmegaConf.to_container(model_cfg, resolve=True),
+        accelerate_kwargs=accelerate_kwargs,
     )
 
     train_dataset = load_dataset(model_cfg.datasets.name, tokenizer, mel_spec_kwargs=model_cfg.model.mel_spec)

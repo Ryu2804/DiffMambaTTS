@@ -62,6 +62,73 @@ def _get_cuda_shared_memory_limit() -> int | None:
     return None
 
 
+def _get_cuda_total_memory() -> int | None:
+    """Return current CUDA device total memory (bytes)."""
+    if not torch.cuda.is_available():
+        return None
+
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        return int(getattr(props, "total_memory", 0))
+    except Exception:
+        return None
+
+
+def _is_low_vram_gpu(max_gib: int = 16) -> bool:
+    total_memory = _get_cuda_total_memory()
+    if total_memory is None:
+        return False
+    return total_memory <= max_gib * (1024**3)
+
+
+def _env_flag(name: str) -> bool | None:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    value = value.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be one of: 1/0/true/false/yes/no/on/off")
+
+
+def _resolve_mamba3_bidirectional(requested_bidirectional: bool) -> bool:
+    """Disable bidirectional scan automatically on low-VRAM GPUs unless overridden."""
+    env_bidirectional = _env_flag("F5_TTS_MAMBA3_BIDIRECTIONAL")
+    if env_bidirectional is not None:
+        return env_bidirectional
+
+    if requested_bidirectional and _is_low_vram_gpu(max_gib=16):
+        warnings.warn(
+            "Detected <=16GB CUDA device; overriding Mamba3 bidirectional=True to False "
+            "to reduce memory usage. Set F5_TTS_MAMBA3_BIDIRECTIONAL=1 to force bidirectional.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return False
+
+    return requested_bidirectional
+
+
+def _resolve_mamba3_checkpoint_activations(requested_checkpoint_activations: bool) -> bool:
+    """Enable gradient checkpointing automatically on low-VRAM GPUs unless overridden."""
+    env_ckpt = _env_flag("F5_TTS_MAMBA3_CHECKPOINT_ACTIVATIONS")
+    if env_ckpt is not None:
+        return env_ckpt
+
+    if (not requested_checkpoint_activations) and _is_low_vram_gpu(max_gib=16):
+        warnings.warn(
+            "Detected <=16GB CUDA device; enabling checkpoint_activations for Mamba3 to reduce memory usage. "
+            "Set F5_TTS_MAMBA3_CHECKPOINT_ACTIVATIONS=0 to disable.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return True
+
+    return requested_checkpoint_activations
+
+
 def _resolve_mamba3_chunk_size(requested_chunk_size: int) -> int:
     """Pick a chunk size that avoids known Triton shared-memory OOR on 64KB GPUs."""
     env_chunk_size = os.environ.get("F5_TTS_MAMBA3_CHUNK_SIZE")
@@ -396,6 +463,7 @@ class Mamba3Block(nn.Module):
         mimo_rank: int = 1,
         chunk_size: int = 64,
         layer_idx: int | None = None,
+        bidirectional: bool = True,
     ):
         super().__init__()
 
@@ -425,10 +493,13 @@ class Mamba3Block(nn.Module):
         if supports_dropout:
             _ssm_kwargs["dropout"] = dropout
 
+        self.bidirectional = bidirectional
+
         # Forward scan
         self.ssm = mamba3_impl(**_ssm_kwargs)
-        # Backward scan — separate parameters, same architecture
-        self.ssm_bwd = mamba3_impl(**_ssm_kwargs)
+        # Backward scan — separate parameters, same architecture.
+        # Optional on low-VRAM setups to avoid doubling SSM activations.
+        self.ssm_bwd = mamba3_impl(**_ssm_kwargs) if self.bidirectional else None
         self.ssm_dropout = nn.Identity() if (dropout == 0.0 or supports_dropout) else nn.Dropout(dropout)
 
         # FF path uses plain LN, then explicit MLP modulation.
@@ -455,10 +526,13 @@ class Mamba3Block(nn.Module):
 
         # Forward scan: left-to-right
         fwd = self.ssm(norm)
-        # Backward scan: flip sequence, scan left-to-right, flip back.
-        # Each token's backward output therefore summarises right-context.
-        bwd = self.ssm_bwd(norm.flip(1)).flip(1)
-        ssm_out = self.ssm_dropout(fwd + bwd)
+        if self.ssm_bwd is not None:
+            # Backward scan: flip sequence, scan left-to-right, flip back.
+            # Each token's backward output therefore summarises right-context.
+            bwd = self.ssm_bwd(norm.flip(1)).flip(1)
+            ssm_out = self.ssm_dropout(fwd + bwd)
+        else:
+            ssm_out = self.ssm_dropout(fwd)
 
         # Zero-out padding positions *after* the scan as well.
         if mask is not None:
@@ -525,6 +599,7 @@ class Mamba3Backbone(nn.Module):
         is_mimo: bool = False,
         mimo_rank: int = 1,
         chunk_size: int = 64,
+        bidirectional: bool = True,
     ):
         super().__init__()
 
@@ -532,6 +607,8 @@ class Mamba3Backbone(nn.Module):
         self.depth = depth
         chunk_size = _resolve_mamba3_chunk_size(chunk_size)
         d_state = _resolve_mamba3_d_state(d_state)
+        bidirectional = _resolve_mamba3_bidirectional(bidirectional)
+        checkpoint_activations = _resolve_mamba3_checkpoint_activations(checkpoint_activations)
 
 
         if text_dim is None:
@@ -565,6 +642,7 @@ class Mamba3Backbone(nn.Module):
                 mimo_rank=mimo_rank,
                 chunk_size=chunk_size,
                 layer_idx=i,
+                bidirectional=bidirectional,
             )
             for i in range(depth)
         ])
