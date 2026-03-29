@@ -54,8 +54,10 @@ class Trainer:
         local_vocoder_path: str = "",  # local vocoder path
         model_cfg_dict: dict = dict(),  # training config
     ):
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
+        # Mamba3 models have no unused parameters, so we can disable this to save memory
+        # DDP with find_unused_parameters=True requires extra autograd graph traversals each iteration
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
         if logger == "wandb" and not wandb.api.api_key:
             logger = None
         self.log_samples = log_samples

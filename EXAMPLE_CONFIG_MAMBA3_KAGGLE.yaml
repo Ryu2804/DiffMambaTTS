@@ -1,0 +1,140 @@
+# Example: Kaggle Mamba3 training config with all OOM fixes applied
+# Apply these settings to your hydra config file
+
+# ============================================================================
+# DATASET CONFIGURATION (datasets.yaml or hydra config)
+# ============================================================================
+datasets:
+  name: "indonesian"           # or your dataset name
+  batch_size_per_gpu: 16       # ← FIX #4: REDUCE from 32 to 16
+  batch_size_type: "sample"
+  max_samples: 16              # tokens per sample
+  num_workers: 4
+  # Optional: Enable gradient accumulation to compensate for smaller batch
+  # This keeps effective batch size = 16 * 2 GPUs * 2 accum = 64
+  
+# ============================================================================
+# OPTIMIZATION CONFIGURATION (optim.yaml or hydra config)
+# ============================================================================
+optim:
+  epochs: 50
+  learning_rate: 1.0e-4
+  num_warmup_updates: 20000
+  max_grad_norm: 1.0
+  grad_accumulation_steps: 2   # ← FIX #4: Optional, compensates for smaller batch
+  bnb_optimizer: false
+  # If using bitsandbytes (8-bit optimizer) also saves ~30% memory
+  # bnb_optimizer: true
+
+# ============================================================================
+# MODEL CONFIGURATION (model -> architecture for Mamba3)
+# ============================================================================
+model:
+  name: "F5_Mamba3_Indonesian"
+  backbone: "Mamba3Backbone"   # Use Mamba3, not DiT
+  mel_spec:
+    n_mel_channels: 100
+    sample_rate: 22050
+    n_fft: 1024
+    hop_length: 256
+    n_mels: 100
+    mel_spec_type: "vocos"
+    
+  arch:                         # Model architecture
+    dim: 768
+    depth: 22
+    heads: 16
+    dim_head: 64
+    dropout: 0.1
+    ff_mult: 2
+    mel_dim: 100
+    text_num_embeds: 256
+    text_dim: null              # defaults to mel_dim
+    checkpoint_activations: true  # ← FIX #2: ENABLE gradient checkpointing
+    # Mamba3 specific:
+    d_state: 128                # will auto-reduce to 64 on 64KB GPUs
+    headdim: 64
+    ngroups: 1
+    rope_fraction: 0.5
+    is_mimo: false
+    mimo_rank: 1
+    chunk_size: 64              # will auto-reduce to 16 on 64KB GPUs
+    
+  tokenizer: "custom"
+  vocoder:
+    is_local: true
+    local_path: ""  # Set this to your local vocoder path if using
+  
+  # Note: The chunk_size and d_state are automatically reduced on Kaggle's 64KB
+  # shared memory GPUs via _resolve_mamba3_chunk_size() and _resolve_mamba3_d_state()
+
+# ============================================================================
+# CHECKPOINT / LOGGING CONFIGURATION
+# ============================================================================
+ckpts:
+  save_dir: "ckpts/mamba3_indonesian"
+  save_per_updates: 500
+  keep_last_n_checkpoints: 3   # Keep last 3 checkpoints
+  last_per_updates: 100        # Save at intermediate steps
+  logger: "wandb"              # or "tensorboard" or None
+  wandb_project: "F5-TTS-Mamba3"
+  wandb_run_name: "mamba3_indonesian_kaggle"
+  wandb_resume_id: null        # Set if resuming from previous run
+  log_samples: false
+
+# ============================================================================
+# ACCELERATE CONFIGURATION (separate: accelerate_kaggle.yaml)
+# ============================================================================
+# File: accelerate_kaggle.yaml
+# Key addition for FIX #3:
+#
+# compute_environment: LOCAL_MACHINE
+# distributed_type: MULTI_GPU
+# downcast_bf16: no
+# dynamo_backend: no
+# fsdp_config: {}
+# gpu_ids: all
+# machine_rank: 0
+# main_training_function: main
+# mixed_precision: fp16        # ← FIX #3: ENABLE mixed precision
+# num_machines: 1
+# num_processes: 2             # For 2 GPUs on Kaggle
+# rdzv_backend: c10d
+# same_network: true
+# tpu_name: null
+# tpu_zone: null
+# use_cpu: false
+# use_dynamo: false
+
+# ============================================================================
+# ENVIRONMENT VARIABLES (set in training script/notebook)
+# ============================================================================
+# FIX #5: Set before training starts:
+#
+# import os
+# os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+#
+# This reduces GPU memory fragmentation by allowing PyTorch to use expandable
+# memory segments instead of fixed allocations.
+
+# ============================================================================
+# TRAINING COMMAND
+# ============================================================================
+# Run this in your Kaggle notebook or script:
+#
+# import os
+# import subprocess
+# import sys
+#
+# # Set environment variable
+# os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+#
+# # Run training
+# cmd = [
+#     sys.executable, "-m", "accelerate.commands.launch",
+#     "--config_file", "accelerate_kaggle.yaml",
+#     "src/f5_tts/train/train.py",
+#     "--config-name", "kaggle_indonesian_mamba3",  # Your config name
+# ]
+# subprocess.run(cmd, check=True)
+
