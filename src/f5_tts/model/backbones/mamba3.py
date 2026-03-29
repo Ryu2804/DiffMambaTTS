@@ -79,19 +79,52 @@ def _resolve_mamba3_chunk_size(requested_chunk_size: int) -> int:
     shared_mem_limit = _get_cuda_shared_memory_limit()
     resolved_chunk_size = requested_chunk_size
 
-    # Mamba-3 Triton SISO backward can exceed 64KB shared memory with chunk_size=64.
-    if shared_mem_limit is not None and shared_mem_limit <= 65536 and requested_chunk_size > 32:
-        resolved_chunk_size = 32
+    # Mamba-3 Triton SISO backward can exceed 64KB shared memory with chunk_size >= 32.
+    # Empirically: chunk_size=32 needs ~73KB, chunk_size=16 needs ~36KB.
+    if shared_mem_limit is not None and shared_mem_limit <= 65536:
+        if requested_chunk_size > 16:
+            resolved_chunk_size = 16
+            warnings.warn(
+                "Detected CUDA device shared memory limit <= 64KB; "
+                f"overriding Mamba3 chunk_size from {requested_chunk_size} to {resolved_chunk_size} "
+                "to avoid Triton OutOfResources in backward. "
+                "Set F5_TTS_MAMBA3_CHUNK_SIZE to force a specific value.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    return resolved_chunk_size
+
+
+def _resolve_mamba3_d_state(requested_d_state: int) -> int:
+    """Reduce d_state if needed to fit Triton kernel shared memory on low-SMEM GPUs."""
+    env_d_state = os.environ.get("F5_TTS_MAMBA3_D_STATE")
+    if env_d_state is not None:
+        try:
+            requested_d_state = int(env_d_state)
+        except ValueError as exc:
+            raise ValueError("F5_TTS_MAMBA3_D_STATE must be an integer") from exc
+
+    if requested_d_state <= 0:
+        raise ValueError("Mamba3 d_state must be > 0")
+
+    shared_mem_limit = _get_cuda_shared_memory_limit()
+    resolved_d_state = requested_d_state
+
+    # On 64KB GPUs, reducing d_state from 128→64 helps reduce shared memory pressure.
+    if shared_mem_limit is not None and shared_mem_limit <= 65536 and requested_d_state > 64:
+        resolved_d_state = 64
         warnings.warn(
             "Detected CUDA device shared memory limit <= 64KB; "
-            f"overriding Mamba3 chunk_size from {requested_chunk_size} to {resolved_chunk_size} "
-            "to avoid Triton OutOfResources in backward. "
-            "Set F5_TTS_MAMBA3_CHUNK_SIZE to force a specific value.",
+            f"overriding Mamba3 d_state from {requested_d_state} to {resolved_d_state} "
+            "to reduce Triton kernel shared memory usage. "
+            "Set F5_TTS_MAMBA3_D_STATE to force a specific value.",
             RuntimeWarning,
             stacklevel=2,
         )
 
-    return resolved_chunk_size
+    return resolved_d_state
+
 
 class _FallbackMamba3(nn.Module):
     """CPU-safe fallback used when mamba kernels are unavailable.
@@ -119,6 +152,7 @@ class _FallbackMamba3(nn.Module):
 
     def forward(self, u, *args, **kwargs):
         return self.net(u)
+
 
 
 def _resolve_mamba3_impl():
@@ -497,6 +531,8 @@ class Mamba3Backbone(nn.Module):
         self.dim = dim
         self.depth = depth
         chunk_size = _resolve_mamba3_chunk_size(chunk_size)
+        d_state = _resolve_mamba3_d_state(d_state)
+
 
         if text_dim is None:
             text_dim = mel_dim
