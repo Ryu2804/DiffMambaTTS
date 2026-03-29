@@ -43,6 +43,56 @@ from f5_tts.model.modules import (
 
 _MAMBA3_IMPL_CACHE = None
 
+
+def _get_cuda_shared_memory_limit() -> int | None:
+    """Return per-block shared-memory limit (bytes) for current CUDA device."""
+    if not torch.cuda.is_available():
+        return None
+
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        # Keep compatibility across torch/CUDA versions.
+        for attr in ("shared_memory_per_block_optin", "shared_memory_per_block"):
+            value = getattr(props, attr, None)
+            if value is not None:
+                return int(value)
+    except Exception:
+        return None
+
+    return None
+
+
+def _resolve_mamba3_chunk_size(requested_chunk_size: int) -> int:
+    """Pick a chunk size that avoids known Triton shared-memory OOR on 64KB GPUs."""
+    env_chunk_size = os.environ.get("F5_TTS_MAMBA3_CHUNK_SIZE")
+    if env_chunk_size is not None:
+        try:
+            requested_chunk_size = int(env_chunk_size)
+        except ValueError as exc:
+            raise ValueError(
+                "F5_TTS_MAMBA3_CHUNK_SIZE must be an integer"
+            ) from exc
+
+    if requested_chunk_size <= 0:
+        raise ValueError("Mamba3 chunk_size must be > 0")
+
+    shared_mem_limit = _get_cuda_shared_memory_limit()
+    resolved_chunk_size = requested_chunk_size
+
+    # Mamba-3 Triton SISO backward can exceed 64KB shared memory with chunk_size=64.
+    if shared_mem_limit is not None and shared_mem_limit <= 65536 and requested_chunk_size > 32:
+        resolved_chunk_size = 32
+        warnings.warn(
+            "Detected CUDA device shared memory limit <= 64KB; "
+            f"overriding Mamba3 chunk_size from {requested_chunk_size} to {resolved_chunk_size} "
+            "to avoid Triton OutOfResources in backward. "
+            "Set F5_TTS_MAMBA3_CHUNK_SIZE to force a specific value.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    return resolved_chunk_size
+
 class _FallbackMamba3(nn.Module):
     """CPU-safe fallback used when mamba kernels are unavailable.
 
@@ -446,6 +496,7 @@ class Mamba3Backbone(nn.Module):
 
         self.dim = dim
         self.depth = depth
+        chunk_size = _resolve_mamba3_chunk_size(chunk_size)
 
         if text_dim is None:
             text_dim = mel_dim
